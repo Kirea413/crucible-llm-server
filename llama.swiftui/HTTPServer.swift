@@ -57,12 +57,59 @@ class HTTPServer {
 
     private func handleConnection(_ connection: NWConnection) {
         connection.start(queue: .global(qos: .userInitiated))
+        receiveRequest(connection, buffer: Data(), sentContinue: false)
+    }
+
+    // HTTP headers and body can arrive in separate TCP reads.
+    private func receiveRequest(_ connection: NWConnection, buffer: Data, sentContinue: Bool) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, error in
             guard let self = self, let data = data, error == nil else {
                 connection.cancel()
                 return
             }
-            let request = String(data: data, encoding: .utf8) ?? ""
+            var received = buffer
+            received.append(data)
+            guard received.count <= 262144 else {
+                self.sendResponse(connection: connection, status: "413 Content Too Large", body: "{\"error\":\"Request too large\"}")
+                return
+            }
+            guard let separator = received.range(of: Data("\r\n\r\n".utf8)) else {
+                guard received.count <= 16384 else {
+                    self.sendResponse(connection: connection, status: "431 Request Header Fields Too Large", body: "{\"error\":\"Headers too large\"}")
+                    return
+                }
+                self.receiveRequest(connection, buffer: received, sentContinue: sentContinue)
+                return
+            }
+            let header = String(decoding: received[..<separator.lowerBound], as: UTF8.self)
+            var headers: [String: String] = [:]
+            for line in header.components(separatedBy: "\r\n").dropFirst() {
+                guard let colon = line.firstIndex(of: ":") else { continue }
+                let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                headers[name] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            }
+            guard headers["transfer-encoding"] == nil else {
+                self.sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Content-Length required; chunked requests unsupported\"}")
+                return
+            }
+            guard let length = Int(headers["content-length"] ?? "0"), length >= 0, length <= 245760 else {
+                self.sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Invalid Content-Length\"}")
+                return
+            }
+            let expectedCount = separator.upperBound + length
+            if received.count < expectedCount {
+                var didContinue = sentContinue
+                if headers["expect"]?.lowercased() == "100-continue", !sentContinue {
+                    connection.send(content: Data("HTTP/1.1 100 Continue\r\n\r\n".utf8), completion: .contentProcessed { _ in })
+                    didContinue = true
+                }
+                self.receiveRequest(connection, buffer: received, sentContinue: didContinue)
+                return
+            }
+            guard let request = String(data: received.prefix(expectedCount), encoding: .utf8) else {
+                self.sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Invalid UTF-8\"}")
+                return
+            }
             self.routeRequest(request, connection: connection)
         }
     }

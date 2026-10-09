@@ -26,8 +26,8 @@ jobs:
       - name: Build llama.cpp xcframework
         run: |
           cd llama.cpp
-          chmod +x build-xcframework.sh
-          ./build-xcframework.sh
+          chmod +x ../scripts/build-ios-framework.sh
+          ../scripts/build-ios-framework.sh
           ls -la build-apple/llama.xcframework/
 
       - name: Build iOS app
